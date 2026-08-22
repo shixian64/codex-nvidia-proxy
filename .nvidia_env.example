@@ -1,5 +1,13 @@
-# NVIDIA API Key (Required)
+# NVIDIA API Key (Required if NVIDIA_API_KEYS is not set)
 NVIDIA_API_KEY=your_api_key_here
+
+# Multiple NVIDIA API Keys (Optional; takes precedence over NVIDIA_API_KEY)
+# Separate keys with commas, semicolons, or newlines.
+# NVIDIA_API_KEYS=key_1,key_2,key_3
+
+# Concurrent requests allowed per key (Optional, default: 4, range: 1-64)
+# The total across all keys may not exceed 64.
+# NVIDIA_THREADS_PER_KEY=4
 
 # Model to use (Optional, default: nvidia/llama-3.1-nemotron-70b-instruct)
 NVIDIA_MODEL=nvidia/llama-3.1-nemotron-70b-instruct
@@ -9,3 +17,6 @@ NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
 
 # Debug mode: 1 to enable, 0 to disable (Optional)
 NVIDIA_DEBUG=0
+
+# Detailed in-memory runtime logs (Optional, default: 0/off)
+NVIDIA_RUNTIME_LOG=0
