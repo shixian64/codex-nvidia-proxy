@@ -1,11 +1,12 @@
 # Codex NVIDIA Proxy
 
-一个轻量级的 NVIDIA API 代理服务，将 NVIDIA NIM API 转换为兼容 OpenAI Chat Completions 和 Responses API 格式，方便接入 Claude Code、Cursor 等支持 OpenAI 协议的开发工具。
+一个轻量级的 NVIDIA API 代理服务，将 NVIDIA NIM API 转换为兼容 OpenAI Chat Completions、Responses API 以及 Anthropic Messages API 的格式，方便接入 Claude Code、Cursor 等开发工具。
 
 ## 功能特性
 
 - 支持 `/responses` 接口（OpenAI Responses API）
 - 支持 `/v1/responses` 和 `/v1/chat/completions` 接口
+- 支持 `/v1/messages`（Anthropic Messages API，Claude Code 原生协议）
 - 自动处理函数调用（Function Calling）
 - 支持工具调用（Tools）
 - CORS 跨域支持
@@ -85,7 +86,7 @@ codex_nvidia_proxy starting ...
    Threads:  4 per key, 4 upstream slots
    Workers:  68 web threads
    Debug:    OFF
-   Routes:   / (UI), /api/*, /responses, /v1/responses, /v1/chat/completions
+   Routes:   / (UI), /api/*, /responses, /v1/responses, /v1/chat/completions, /v1/messages
 ```
 
 ### 网页控制台
@@ -110,10 +111,16 @@ Key 输入框留空时仅沿用当前配置，来自系统环境变量的 Key �
 
 #### Claude Code / Claude CLI
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:5000
-export ANTHROPIC_API_KEY=any_key  # 任意值即可
+# Claude Code 使用 Anthropic Messages API（不是 OpenAI /chat/completions）。
+# Windows PowerShell：
+$env:ANTHROPIC_BASE_URL="http://127.0.0.1:5000"
+$env:ANTHROPIC_API_KEY="any_key"  # 本地代理仅用于兼容，任意非空值即可
+$env:ANTHROPIC_MODEL="nvidia/llama-3.1-nemotron-70b-instruct"  # 可选：让 Claude Code 在请求中指定 NIM 模型
+# Linux/macOS：export ANTHROPIC_BASE_URL=...; export ANTHROPIC_API_KEY=...
 claude
 ```
+
+也可以直接使用 `claude --model nvidia/llama-3.1-nemotron-70b-instruct`。代理会优先使用请求中的模型名；但 Claude Code 默认发送的 `claude-*` 模型名会自动映射到 `NVIDIA_MODEL`，因为 NVIDIA 上游不认识 Claude 的模型 ID。
 
 #### Cursor
 在 Cursor 设置中配置：
@@ -137,6 +144,7 @@ claude
 | `POST /responses` | OpenAI Responses API |
 | `POST /v1/responses` | OpenAI Responses API (v1) |
 | `POST /v1/chat/completions` | OpenAI Chat Completions API |
+| `POST /v1/messages` | Anthropic Messages API（Claude Code） |
 
 ## 配置选项
 

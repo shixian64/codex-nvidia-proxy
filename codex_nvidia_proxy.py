@@ -585,6 +585,245 @@ def extract_messages(data: dict):
     return messages, tools, tool_choice
 
 
+# ---- Anthropic Messages API（Claude Code）适配 ----
+def _anthropic_text(content):
+    """将 Anthropic content block 转成可放入 OpenAI content 的文本。"""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    texts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in ("text", "input_text", "output_text"):
+            text = block.get("text", "")
+            if text:
+                texts.append(str(text))
+    return "\n".join(texts)
+
+
+def _anthropic_image_block(block):
+    """尽量保留 Anthropic 图片输入；文本模型会由上游自行返回不支持错误。"""
+    source = block.get("source") if isinstance(block, dict) else None
+    if not isinstance(source, dict):
+        return None
+    if source.get("type") == "base64" and source.get("media_type") and source.get("data"):
+        url = f"data:{source['media_type']};base64,{source['data']}"
+    elif source.get("type") == "url" and source.get("url"):
+        url = source["url"]
+    else:
+        return None
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _anthropic_messages(data: dict):
+    """把 Anthropic Messages API 请求转换成 NVIDIA 所用的 OpenAI messages。"""
+    messages = []
+    system = data.get("system")
+    if system:
+        system_text = _anthropic_text(system)
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+
+    raw_messages = data.get("messages", [])
+    if not isinstance(raw_messages, list):
+        return messages
+
+    for raw in raw_messages:
+        if not isinstance(raw, dict):
+            continue
+        role = raw.get("role", "user")
+        content = raw.get("content", "")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+        if not isinstance(blocks, list):
+            blocks = []
+
+        text_parts = []
+        openai_parts = []
+        tool_results = []
+        tool_calls = []
+        for block in blocks:
+            if not isinstance(block, dict):
+                if isinstance(block, str):
+                    text_parts.append(block)
+                continue
+            block_type = block.get("type")
+            if block_type in ("text", "input_text", "output_text"):
+                text = block.get("text", "")
+                if text:
+                    text_parts.append(str(text))
+                    openai_parts.append({"type": "text", "text": str(text)})
+            elif block_type == "image":
+                image = _anthropic_image_block(block)
+                if image:
+                    openai_parts.append(image)
+            elif block_type == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name", ""),
+                        "arguments": json.dumps(block.get("input", {}), ensure_ascii=False),
+                    },
+                })
+            elif block_type == "tool_result":
+                result = block.get("content", "")
+                result_text = _anthropic_text(result) if isinstance(result, list) else str(result or "")
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": block.get("tool_use_id", ""),
+                    "content": result_text,
+                })
+
+        if role == "assistant":
+            if tool_calls:
+                messages.append({
+                    "role": "assistant",
+                    "content": "\n".join(text_parts) or "",
+                    "tool_calls": tool_calls,
+                })
+            elif text_parts:
+                messages.append({"role": "assistant", "content": "\n".join(text_parts)})
+        elif role == "user":
+            # Anthropic 将 tool_result 放在 user 消息中；OpenAI 要求它们紧跟
+            # assistant.tool_calls。混合块时先放 tool 消息，避免中间插入普通
+            # user 消息导致 NVIDIA/OpenAI 校验失败。
+            messages.extend(tool_results)
+            if openai_parts:
+                messages.append({
+                    "role": "user",
+                    "content": "\n".join(text_parts) if not any(p.get("type") == "image_url" for p in openai_parts) else openai_parts,
+                })
+            elif not tool_results:
+                messages.append({"role": "user", "content": ""})
+        else:
+            # 兼容少数代理发送的 developer/system 消息。
+            text = "\n".join(text_parts) or _anthropic_text(content)
+            if text:
+                messages.append({"role": "system" if role == "developer" else role, "content": text})
+
+    # 工具结果必须跟在对应 assistant.tool_calls 后面。Claude Code 通常已经
+    # 按此顺序发送，但这里再做一次稳定重排以兼容同一 user 块中的混合内容。
+    reordered = []
+    i = 0
+    while i < len(messages):
+        msg = messages[i]
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            ids = {call.get("id") for call in msg["tool_calls"]}
+            pending = []
+            j = i + 1
+            while j < len(messages):
+                nxt = messages[j]
+                if nxt.get("role") == "tool" and nxt.get("tool_call_id") in ids:
+                    pending.append(nxt)
+                    ids.discard(nxt.get("tool_call_id"))
+                    j += 1
+                elif nxt.get("role") in ("system", "developer"):
+                    reordered.append(nxt)
+                    j += 1
+                else:
+                    break
+            reordered.append(msg)
+            reordered.extend(pending)
+            i = j
+        else:
+            reordered.append(msg)
+            i += 1
+    return reordered
+
+
+def _anthropic_tools(raw_tools):
+    """Anthropic tool 定义 -> OpenAI function tool。"""
+    result = []
+    if not isinstance(raw_tools, list):
+        return result
+    for tool in raw_tools:
+        if not isinstance(tool, dict):
+            continue
+        # Anthropic 使用 name/description/input_schema，没有 type=function 包装。
+        name = tool.get("name")
+        if not name:
+            continue
+        result.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": tool.get("description", ""),
+                "parameters": _clean_schema(tool.get("input_schema", tool.get("parameters", {"type": "object"}))),
+            },
+        })
+    return result
+
+
+def _anthropic_tool_choice(choice):
+    if not isinstance(choice, dict):
+        return choice if choice in ("auto", "none", "required") else "auto"
+    kind = choice.get("type", "auto")
+    if kind == "auto":
+        return "auto"
+    if kind in ("any", "required"):
+        return "required"
+    if kind in ("tool", "function") and choice.get("name"):
+        return {"type": "function", "function": {"name": choice["name"]}}
+    return "auto"
+
+
+def _anthropic_parallel_tool_calls(choice):
+    """保留 Anthropic tool_choice.disable_parallel_tool_use 约束。"""
+    if isinstance(choice, dict) and choice.get("disable_parallel_tool_use") is True:
+        return False
+    return None
+
+
+def _anthropic_stop_sequences(value):
+    """规范化 Anthropic stop_sequences，便于响应中回填 stop_sequence。"""
+    if isinstance(value, str):
+        return [value] if value else []
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [str(item) for item in value if item is not None and str(item)]
+
+
+def _anthropic_stop_result(finish_reason, stop_sequences=None, text="", has_tools=False):
+    """映射 OpenAI finish_reason 到 Anthropic stop_reason/stop_sequence。"""
+    if finish_reason == "length":
+        # 工具参数可能在 max_tokens 限制下只生成了一部分；不能把它
+        # 报告为可执行的 tool_use，否则调用方可能用不完整参数执行工具。
+        return "max_tokens", None
+    if finish_reason in ("tool_calls", "function_call") or has_tools:
+        return "tool_use", None
+    stop_sequences = _anthropic_stop_sequences(stop_sequences)
+    if finish_reason == "stop" and stop_sequences:
+        # 部分 OpenAI 兼容端点会把停止串从输出中移除，因此无法总是从
+        # 文本末尾判断命中的具体项；单项或无法辨别时回填第一个请求项。
+        matched = next((item for item in stop_sequences if text.endswith(item)), None)
+        return "stop_sequence", matched or stop_sequences[0]
+    return "end_turn", None
+
+
+def _anthropic_effective_model(requested):
+    """Claude Code 发送的是 Claude 模型名，不能原样传给 NVIDIA NIM。"""
+    if not requested:
+        return NVIDIA_MODEL
+    requested = str(requested).strip()
+    if not requested:
+        return NVIDIA_MODEL
+    # Claude Code 默认使用 claude-*（或 anthropic/*）名称；这类名称统一
+    # 映射到控制台/环境变量中的 NVIDIA_MODEL。手工传入 nvidia/* 等名称时
+    # 仍允许按请求选择模型，便于测试多个 NIM 模型。
+    if requested.lower().startswith(("claude", "anthropic/")):
+        return NVIDIA_MODEL
+    return requested
+
+
+def _obj_get(obj, name, default=None):
+    """同时支持 OpenAI SDK 对象和测试中使用的 dict。"""
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
 # ---- Web UI / 控制 API ----
 @app.get("/")
 def web_ui():
@@ -895,7 +1134,10 @@ def api_model_test():
 @app.after_request
 def add_cors(resp):
     # 只有代理协议端点允许跨域；控制台页面和管理 API 均不开放 CORS。
-    if request.path in ("/responses", "/v1/responses", "/v1/chat/completions"):
+    if request.path in (
+        "/responses", "/v1/responses", "/v1/chat/completions",
+        "/messages", "/v1/messages",
+    ):
         resp.headers["Access-Control-Allow-Origin"] = "*"
         resp.headers["Access-Control-Allow-Headers"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
@@ -908,6 +1150,292 @@ def add_cors(resp):
 
 
 # ---- 路由处理 ----
+def _anthropic_error(message, status=400, error_type="invalid_request_error"):
+    return jsonify({
+        "type": "error",
+        "error": {"type": error_type, "message": str(message)},
+    }), status
+
+
+def _anthropic_upstream_kwargs(
+    req_data, messages, tools, tool_choice, effective_model, stream,
+    parallel_tool_calls=None,
+):
+    """构建 Anthropic -> NVIDIA OpenAI Chat Completions 的参数。"""
+    kwargs = {"model": effective_model, "messages": messages, "stream": stream}
+    # Claude Code 会发送 max_tokens；NVIDIA OpenAI 兼容端点支持这些常用字段。
+    for source, target in (
+        ("max_tokens", "max_tokens"),
+        ("temperature", "temperature"),
+        ("top_p", "top_p"),
+        ("top_k", "top_k"),
+        ("stop_sequences", "stop"),
+    ):
+        value = req_data.get(source)
+        if source == "stop_sequences":
+            value = _anthropic_stop_sequences(value)
+            if not value:
+                continue
+        if value is not None:
+            kwargs[target] = value
+    if tools:
+        kwargs["tools"] = tools
+        if tool_choice != "auto":
+            kwargs["tool_choice"] = tool_choice
+        if parallel_tool_calls is not None:
+            kwargs["parallel_tool_calls"] = parallel_tool_calls
+    return kwargs
+
+
+def _anthropic_message_from_completion(
+    completion, effective_model, messages, stop_sequences=None,
+):
+    """将 OpenAI 非流式 completion 转为 Anthropic Message JSON。"""
+    choices = _obj_get(completion, "choices", []) or []
+    choice = choices[0] if choices else {}
+    message = _obj_get(choice, "message", {}) or {}
+    finish_reason = _obj_get(choice, "finish_reason", "stop")
+    raw_tool_calls = _obj_get(message, "tool_calls", []) or []
+    text = _obj_get(message, "content", "") or ""
+    blocks = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    # finish_reason=length 时工具参数可能是不完整 JSON。省略该 tool_use，
+    # 并通过 stop_reason=max_tokens 明确告知调用方不得执行它。
+    tool_calls = [] if finish_reason == "length" else raw_tool_calls
+    for tool_call in tool_calls:
+        function = _obj_get(tool_call, "function", {}) or {}
+        arguments = _obj_get(function, "arguments", "") or "{}"
+        try:
+            parsed_input = json.loads(arguments)
+        except (TypeError, ValueError):
+            parsed_input = {}
+        blocks.append({
+            "type": "tool_use",
+            "id": _obj_get(tool_call, "id", "") or f"toolu_{uuid.uuid4().hex[:12]}",
+            "name": _obj_get(function, "name", "") or "",
+            "input": parsed_input,
+        })
+    stop_reason, stop_sequence = _anthropic_stop_result(
+        finish_reason, stop_sequences, text, bool(tool_calls),
+    )
+    usage = _obj_get(completion, "usage", {}) or {}
+    input_tokens = _obj_get(usage, "prompt_tokens", 0) or _estimate_tokens(json.dumps(messages, ensure_ascii=False))
+    output_basis = text + "".join(
+        _obj_get(_obj_get(tc, "function", {}) or {}, "arguments", "") or ""
+        for tc in tool_calls
+    )
+    output_tokens = _obj_get(usage, "completion_tokens", 0) or _estimate_tokens(output_basis)
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:20]}",
+        "type": "message",
+        "role": "assistant",
+        "content": blocks,
+        "model": effective_model,
+        "stop_reason": stop_reason,
+        "stop_sequence": stop_sequence,
+        "usage": {"input_tokens": input_tokens, "output_tokens": output_tokens},
+    }
+
+
+def _make_anthropic_response():
+    """Anthropic Messages API 兼容入口，供 Claude Code/Claude CLI 使用。"""
+    if request.method == "OPTIONS":
+        return Response()
+    with _SERVICE_STATE_LOCK:
+        service_running = _SERVICE_RUNNING
+    if not service_running:
+        return _anthropic_error("代理服务当前已停止，请先通过网页控制台启动服务", 503, "api_error")
+
+    req_data = request.get_json(silent=True)
+    if not isinstance(req_data, dict):
+        return _anthropic_error("请求体必须是 JSON 对象")
+    raw_messages = req_data.get("messages")
+    if not isinstance(raw_messages, list) or not raw_messages:
+        return _anthropic_error("messages 必须是非空数组")
+
+    messages = _anthropic_messages(req_data)
+    tools = _anthropic_tools(req_data.get("tools", []))
+    tool_choice = _anthropic_tool_choice(req_data.get("tool_choice"))
+    parallel_tool_calls = _anthropic_parallel_tool_calls(req_data.get("tool_choice"))
+    stop_sequences = _anthropic_stop_sequences(req_data.get("stop_sequences"))
+    effective_model = _anthropic_effective_model(req_data.get("model"))
+    response_id = f"msg_{uuid.uuid4().hex[:20]}"
+    stream_requested = req_data.get("stream") is True
+    _runtime_log(
+        "REQUEST", "anthropic.request",
+        lambda: json.dumps({
+            "path": request.path,
+            "model": effective_model,
+            "messages": messages,
+            "tools_count": len(tools),
+            "tool_choice": tool_choice,
+            "parallel_tool_calls": parallel_tool_calls,
+            "stop_sequences": stop_sequences,
+            "stream": stream_requested,
+        }, ensure_ascii=False, default=str),
+        response_id,
+    )
+
+    kwargs = _anthropic_upstream_kwargs(
+        req_data, messages, tools, tool_choice, effective_model, stream_requested,
+        parallel_tool_calls,
+    )
+
+    if not stream_requested:
+        slot = None
+        try:
+            slot = _acquire_client_slot(blocking=False)
+            if slot is None:
+                return _anthropic_error("所有 NVIDIA API Key 的并发槽位均已占满，请稍后重试", 429, "rate_limit_error")
+            _runtime_log("INFO", "anthropic.upstream.start", f"Key {slot['index']} -> model={effective_model}", response_id)
+            completion = slot["client"].chat.completions.create(**kwargs)
+            result = _anthropic_message_from_completion(
+                completion, effective_model, messages, stop_sequences,
+            )
+            _runtime_log("DONE", "anthropic.completed", lambda: json.dumps(result, ensure_ascii=False), response_id)
+            return jsonify(result)
+        except Exception as exc:
+            err_msg = f"NVIDIA API error: {type(exc).__name__}: {exc}"
+            _runtime_log("ERROR", "anthropic.failed", err_msg, response_id)
+            return _anthropic_error(err_msg, 502, "api_error")
+        finally:
+            if slot is not None:
+                _release_client_slot(slot)
+
+    def generate_anthropic():
+        # Claude Code 依赖标准 Anthropic SSE 事件顺序，而不是 Responses API 事件。
+        def sse(event, payload):
+            return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+        input_tokens = _estimate_tokens(json.dumps(messages, ensure_ascii=False))
+        output_tokens = 0
+        full_text = ""
+        tool_acc = {}
+        block_indices = {}
+        block_order = []
+        finish_reason = "stop"
+        slot = None
+
+        yield sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": response_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": effective_model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        })
+        try:
+            slot = _acquire_client_slot(blocking=False)
+            if slot is None:
+                raise RuntimeError("所有 NVIDIA API Key 的并发槽位均已占满，请稍后重试")
+            _runtime_log("INFO", "anthropic.upstream.start", f"Key {slot['index']} -> model={effective_model}", response_id)
+            stream = slot["client"].chat.completions.create(**kwargs)
+            for chunk in stream:
+                usage = _obj_get(chunk, "usage")
+                if usage:
+                    input_tokens = _obj_get(usage, "prompt_tokens", input_tokens) or input_tokens
+                    output_tokens = _obj_get(usage, "completion_tokens", output_tokens) or output_tokens
+                choices = _obj_get(chunk, "choices", []) or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                finish_reason = _obj_get(choice, "finish_reason", finish_reason) or finish_reason
+                delta = _obj_get(choice, "delta", {}) or {}
+                content = _obj_get(delta, "content", "") or ""
+                if not isinstance(content, str):
+                    content = _anthropic_text(content) if isinstance(content, list) else str(content)
+                if content:
+                    key = ("text", 0)
+                    if key not in block_indices:
+                        block_indices[key] = len(block_order)
+                        block_order.append(key)
+                        yield sse("content_block_start", {
+                            "type": "content_block_start", "index": block_indices[key],
+                            "content_block": {"type": "text", "text": ""},
+                        })
+                    full_text += content
+                    _runtime_log("DELTA", "anthropic.response.delta", content, response_id)
+                    yield sse("content_block_delta", {
+                        "type": "content_block_delta", "index": block_indices[key],
+                        "delta": {"type": "text_delta", "text": content},
+                    })
+
+                for tool_call in _obj_get(delta, "tool_calls", []) or []:
+                    index = _obj_get(tool_call, "index", 0)
+                    key = ("tool", index)
+                    function = _obj_get(tool_call, "function", {}) or {}
+                    acc = tool_acc.setdefault(index, {
+                        "id": "", "name": "", "arguments": "",
+                    })
+                    call_id = _obj_get(tool_call, "id")
+                    name = _obj_get(function, "name")
+                    arguments = _obj_get(function, "arguments", "") or ""
+                    if call_id:
+                        acc["id"] = call_id
+                    if name:
+                        acc["name"] = name
+                    if key not in block_indices:
+                        if not acc["id"]:
+                            acc["id"] = f"toolu_{uuid.uuid4().hex[:12]}"
+                        block_indices[key] = len(block_order)
+                        block_order.append(key)
+                        yield sse("content_block_start", {
+                            "type": "content_block_start", "index": block_indices[key],
+                            "content_block": {
+                                "type": "tool_use", "id": acc["id"],
+                                "name": acc["name"], "input": {},
+                            },
+                        })
+                    if arguments:
+                        acc["arguments"] += arguments
+                        _runtime_log("TOOL", "anthropic.tool.arguments.delta", arguments, response_id)
+                        yield sse("content_block_delta", {
+                            "type": "content_block_delta", "index": block_indices[key],
+                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                        })
+
+            for key in block_order:
+                yield sse("content_block_stop", {
+                    "type": "content_block_stop", "index": block_indices[key],
+                })
+            stop_reason, stop_sequence = _anthropic_stop_result(
+                finish_reason, stop_sequences, full_text, bool(tool_acc),
+            )
+            if not output_tokens:
+                output_tokens = _estimate_tokens(full_text + "".join(v["arguments"] for v in tool_acc.values()))
+            yield sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop_reason, "stop_sequence": stop_sequence},
+                "usage": {"output_tokens": output_tokens},
+            })
+            _runtime_log("DONE", "anthropic.completed", lambda: json.dumps({
+                "model": effective_model, "text": full_text, "tool_calls": tool_acc,
+            }, ensure_ascii=False, default=str), response_id)
+            yield sse("message_stop", {"type": "message_stop"})
+        except Exception as exc:
+            err_msg = f"NVIDIA API error: {type(exc).__name__}: {exc}"
+            _runtime_log("ERROR", "anthropic.failed", err_msg, response_id)
+            yield sse("error", {
+                "type": "error",
+                "error": {"type": "api_error", "message": err_msg},
+            })
+        finally:
+            if slot is not None:
+                _release_client_slot(slot)
+
+    return Response(
+        generate_anthropic(),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 def _make_response():
     if request.method == "OPTIONS":
         return Response()
@@ -1243,6 +1771,8 @@ def _make_response():
 app.add_url_rule("/responses", "responses", _make_response, methods=["POST", "OPTIONS"])
 app.add_url_rule("/v1/responses", "v1_responses", _make_response, methods=["POST", "OPTIONS"])
 app.add_url_rule("/v1/chat/completions", "v1_chat", _make_response, methods=["POST", "OPTIONS"])
+app.add_url_rule("/messages", "messages", _make_anthropic_response, methods=["POST", "OPTIONS"])
+app.add_url_rule("/v1/messages", "v1_messages", _make_anthropic_response, methods=["POST", "OPTIONS"])
 
 
 if __name__ == "__main__":
@@ -1275,5 +1805,8 @@ if __name__ == "__main__":
     if capacity_error:
         print(f"   Config:   ERROR: {capacity_error}")
     print(f"   Debug:    {'ON' if NVIDIA_DEBUG else 'OFF'}")
-    print(f"   Routes:   / (UI), /api/*, /responses, /v1/responses, /v1/chat/completions")
+    print(
+        "   Routes:   / (UI), /api/*, /responses, /v1/responses, "
+        "/v1/chat/completions, /v1/messages (Anthropic)"
+    )
     serve(app, host="127.0.0.1", port=5000, threads=server_threads)
