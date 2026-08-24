@@ -7,6 +7,7 @@ import getpass
 import re
 import hmac
 import secrets
+import time
 from collections import deque
 from datetime import datetime
 from threading import Condition, RLock
@@ -23,6 +24,10 @@ MAX_THREADS_PER_KEY = 64
 MAX_TOTAL_UPSTREAM_SLOTS = 64
 MANAGEMENT_WORKER_RESERVE = 4
 WEB_SERVER_THREADS = MAX_TOTAL_UPSTREAM_SLOTS + MANAGEMENT_WORKER_RESERVE
+# 模型列表是控制台辅助请求，不应继承 OpenAI SDK 的长默认超时。
+# 同时限制单个 Key 和整个聚合请求的耗时，避免一个不可达的上游拖住后续 Key。
+MODEL_LIST_REQUEST_TIMEOUT = 10.0
+MODEL_LIST_TOTAL_TIMEOUT = 30.0
 
 
 def _load_dotenv():
@@ -263,11 +268,13 @@ def _active_upstream_slots():
     return sum(state["active"] for state in _KEY_SLOT_STATES.values())
 
 
-def _acquire_client_slot(preferred_entry=None, blocking=True):
+def _acquire_client_slot(preferred_entry=None, blocking=True, deadline=None):
     """从客户端池中选择空闲 Key，同时执行跨热切换池的全局并发限制。"""
     global _POOL_ROUND_ROBIN_INDEX
     with _POOL_CONDITION:
         while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
             pool = _get_client_pool()
             if not pool:
                 raise RuntimeError("未配置 NVIDIA API Key")
@@ -283,7 +290,8 @@ def _acquire_client_slot(preferred_entry=None, blocking=True):
                     return preferred_entry
                 if not blocking:
                     return None
-                _POOL_CONDITION.wait()
+                wait_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+                _POOL_CONDITION.wait(wait_timeout)
                 continue
 
             if has_global_slot:
@@ -298,7 +306,8 @@ def _acquire_client_slot(preferred_entry=None, blocking=True):
                         return entry
             if not blocking:
                 return None
-            _POOL_CONDITION.wait()
+            wait_timeout = None if deadline is None else max(0, deadline - time.monotonic())
+            _POOL_CONDITION.wait(wait_timeout)
 
 
 def _release_client_slot(entry):
@@ -363,20 +372,22 @@ def _save_runtime_config(keys, model, threads_per_key):
 def _service_status():
     with _SERVICE_STATE_LOCK:
         running = _SERVICE_RUNNING
-    capacity_error = _capacity_error(NVIDIA_API_KEYS, NVIDIA_THREADS_PER_KEY)
+        keys = list(NVIDIA_API_KEYS)
+        threads_per_key = NVIDIA_THREADS_PER_KEY
+        model = NVIDIA_MODEL
+        base_url = NVIDIA_BASE_URL
+    capacity_error = _capacity_error(keys, threads_per_key)
     return {
         "running": running,
-        "configured": bool(NVIDIA_API_KEYS),
-        "key_count": len(NVIDIA_API_KEYS),
-        "keys": [_mask_key(key) for key in NVIDIA_API_KEYS],
-        "threads_per_key": NVIDIA_THREADS_PER_KEY,
-        "total_threads": (
-            len(NVIDIA_API_KEYS) * NVIDIA_THREADS_PER_KEY if not capacity_error else 0
-        ),
+        "configured": bool(keys),
+        "key_count": len(keys),
+        "keys": [_mask_key(key) for key in keys],
+        "threads_per_key": threads_per_key,
+        "total_threads": len(keys) * threads_per_key if not capacity_error else 0,
         "max_total_threads": MAX_TOTAL_UPSTREAM_SLOTS,
         "configuration_error": capacity_error,
-        "model": NVIDIA_MODEL,
-        "base_url": NVIDIA_BASE_URL,
+        "model": model,
+        "base_url": base_url,
         "runtime_log_enabled": _RUNTIME_LOG_ENABLED,
     }
 
@@ -672,39 +683,45 @@ def api_config():
     if capacity_error:
         return jsonify({"error": capacity_error}), 400
 
-    # 配置变更时先停止新请求，再替换客户端池；已有请求仍可安全释放旧槽位。
-    _set_service_running(False)
-    NVIDIA_THREADS_PER_KEY = threads
-    # 输入框留空时只沿用内存中的 Key，不将可能来自系统环境变量的凭据写入磁盘。
-    _save_runtime_config(submitted_keys or None, model, threads)
-    _init_client_pool(keys)
-    NVIDIA_MODEL = model
-    _runtime_log(
-        "INFO", "config.saved",
-        f"配置已保存：keys={len(keys)}, threads_per_key={threads}, model={model}；代理保持停止",
-    )
-    return jsonify({"ok": True, **_service_status()})
+    # 配置、客户端池和运行状态必须在同一把锁下完成切换，避免与并发的
+    # /api/service/start 交错，导致保存后代理被意外重新启动。
+    with _SERVICE_STATE_LOCK:
+        # 配置变更时先停止新请求，再替换客户端池；已有请求仍可安全释放旧槽位。
+        _set_service_running(False)
+        NVIDIA_THREADS_PER_KEY = threads
+        # 输入框留空时只沿用内存中的 Key，不将可能来自系统环境变量的凭据写入磁盘。
+        _save_runtime_config(submitted_keys or None, model, threads)
+        _init_client_pool(keys)
+        NVIDIA_MODEL = model
+        _runtime_log(
+            "INFO", "config.saved",
+            f"配置已保存：keys={len(keys)}, threads_per_key={threads}, model={model}；代理保持停止",
+        )
+        return jsonify({"ok": True, **_service_status()})
 
 
 @app.post("/api/service/start")
 def api_service_start():
-    keys = _configured_api_keys()
-    if not keys:
-        return jsonify({"error": "未配置 NVIDIA API Key"}), 400
-    capacity_error = _capacity_error(keys, NVIDIA_THREADS_PER_KEY)
-    if capacity_error:
-        return jsonify({"error": capacity_error}), 400
-    _init_client_pool(keys)
-    _set_service_running(True)
-    _runtime_log("INFO", "service.started", f"代理已启动：keys={len(keys)}, model={NVIDIA_MODEL}")
-    return jsonify({"ok": True, **_service_status()})
+    # 与配置保存共用状态锁，保证检查配置、初始化客户端池、启动服务不可交错。
+    with _SERVICE_STATE_LOCK:
+        keys = _configured_api_keys()
+        if not keys:
+            return jsonify({"error": "未配置 NVIDIA API Key"}), 400
+        capacity_error = _capacity_error(keys, NVIDIA_THREADS_PER_KEY)
+        if capacity_error:
+            return jsonify({"error": capacity_error}), 400
+        _init_client_pool(keys)
+        _set_service_running(True)
+        _runtime_log("INFO", "service.started", f"代理已启动：keys={len(keys)}, model={NVIDIA_MODEL}")
+        return jsonify({"ok": True, **_service_status()})
 
 
 @app.post("/api/service/stop")
 def api_service_stop():
-    _set_service_running(False)
-    _runtime_log("INFO", "service.stopped", "代理已停止；管理控制台继续运行")
-    return jsonify({"ok": True, **_service_status()})
+    with _SERVICE_STATE_LOCK:
+        _set_service_running(False)
+        _runtime_log("INFO", "service.stopped", "代理已停止；管理控制台继续运行")
+        return jsonify({"ok": True, **_service_status()})
 
 
 @app.get("/api/models")
@@ -715,6 +732,7 @@ def api_models():
     if not keys:
         return jsonify({"error": "请先配置 NVIDIA API Key"}), 400
     _runtime_log("REQUEST", "models.list", f"开始从 {len(keys)} 个 Key 聚合模型列表", log_id)
+    aggregation_deadline = time.monotonic() + MODEL_LIST_TOTAL_TIMEOUT
 
     pool = _get_client_pool()
     pool_keys = [entry["key"] for entry in pool]
@@ -725,14 +743,42 @@ def api_models():
     successful_keys = []
     errors = []
     for index, entry in enumerate(pool, start=1):
+        if time.monotonic() >= aggregation_deadline:
+            errors.append(f"模型列表聚合超过 {MODEL_LIST_TOTAL_TIMEOUT:g} 秒总超时")
+            break
         slot = None
         try:
             # 模型查询也占用对应 Key 的并发槽位，确保每个 Key 不超过配置上限。
-            slot = _acquire_client_slot(preferred_entry=entry)
-            page = slot["client"].models.list()
+            # 控制台查询不等待繁忙 Key，避免一个满载 Key 阻塞其他 Key；总截止时间
+            # 仍传入槽位获取逻辑，防止未来改为阻塞模式时失去截止约束。
+            slot = _acquire_client_slot(
+                preferred_entry=entry, blocking=False, deadline=aggregation_deadline,
+            )
+            if slot is None:
+                errors.append(f"Key {index}: 并发槽位已满或聚合已超时")
+                continue
+            remaining = aggregation_deadline - time.monotonic()
+            if remaining <= 0:
+                errors.append(f"Key {index}: 模型列表聚合已超时")
+                continue
+            request_timeout = min(MODEL_LIST_REQUEST_TIMEOUT, remaining)
+            client = slot["client"]
+            if hasattr(client, "with_options"):
+                # 禁止 SDK 为不可达上游自动重试，否则单次 timeout 可能被重复叠加，
+                # 使整个聚合请求超过截止时间。
+                page = client.with_options(
+                    timeout=request_timeout, max_retries=0,
+                ).models.list()
+            else:
+                # 兼容较旧的 OpenAI SDK 或测试替身。
+                page = client.models.list(timeout=request_timeout)
             items = page.auto_paging_iter() if hasattr(page, "auto_paging_iter") else getattr(page, "data", page)
             key_model_ids = set()
             for item in items:
+                if time.monotonic() >= aggregation_deadline:
+                    raise TimeoutError(
+                        f"模型列表聚合超过 {MODEL_LIST_TOTAL_TIMEOUT:g} 秒总超时"
+                    )
                 model_id = item.get("id") if isinstance(item, dict) else getattr(item, "id", None)
                 if model_id:
                     key_model_ids.add(str(model_id))
@@ -854,6 +900,10 @@ def add_cors(resp):
         resp.headers["Access-Control-Allow-Headers"] = "*"
         resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     resp.headers["X-Content-Type-Options"] = "nosniff"
+    # 控制台包含启动、停止和日志清理等高影响操作，禁止被第三方页面嵌入后
+    # 通过点击劫持诱导本机用户操作。两种响应头同时设置以兼容旧浏览器。
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'none'"
     return resp
 
 
